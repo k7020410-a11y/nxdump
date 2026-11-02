@@ -1,32 +1,38 @@
 name: Build APK
+
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.10.2
-      - name: Decode keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: echo "$KEYSTORE_BASE64" | base64 -d > "$GITHUB_WORKSPACE/release.jks"
-      - name: Build release APK
-        env:
-          KEYSTORE_FILE: ${{ github.workspace }}/release.jks
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: gradle assembleRelease --no-daemon --stacktrace
-      - uses: actions/upload-artifact@v4
+          gradle-version: "8.10.2"
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
         with:
-          name: NxDump-apk
-          path: app/build/outputs/apk/release/*.apk
+          name: NxDump-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
