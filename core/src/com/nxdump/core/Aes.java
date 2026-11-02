@@ -9,7 +9,14 @@ import javax.crypto.spec.SecretKeySpec;
 final class Aes {
     private Aes() {}
 
-    private static final int CHUNK = 1 << 20;
+    private static final int CHUNK = 4 << 20; // 4 MB chunk
+    private static final ThreadLocal<Cipher> CTR_CIPHER = ThreadLocal.withInitial(() -> {
+        try {
+            return Cipher.getInstance("AES/CTR/NoPadding");
+        } catch (GeneralSecurityException e) {
+            throw new RuntimeException(e);
+        }
+    });
 
     static byte[] ecbDecrypt(byte[] key, byte[] data) throws NxException {
         try {
@@ -69,7 +76,7 @@ final class Aes {
                 raw.read(pos - pre, tmp, 0, pre + n);
                 byte[] iv = upper16.clone();
                 Bin.putBe64(iv, 8, (abs - pre) >>> 4);
-                Cipher c = Cipher.getInstance("AES/CTR/NoPadding");
+                Cipher c = CTR_CIPHER.get();
                 c.init(Cipher.DECRYPT_MODE, ks, new IvParameterSpec(iv));
                 byte[] out = c.doFinal(tmp);
                 System.arraycopy(out, pre, b, off, n);
