@@ -220,7 +220,7 @@ public final class UpdateNsp {
             throw new InterruptedIOException("Cancelled");
         }
 
-        byte[] buf = new byte[1 << 20];
+        byte[] buf = new byte[4 << 20]; // 4 MB buffer for high throughput
         long done = 0;
 
         prog.update(plan.fileName, 0, plan.totalSize);
