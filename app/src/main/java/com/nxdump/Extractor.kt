@@ -14,12 +14,22 @@ import android.os.SystemClock
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.nxdump.core.Dumper
+import com.nxdump.core.Keys
+import com.nxdump.core.UpdateNsp
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.nio.channels.ClosedByInterruptException
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
+
+enum class Mode {
+    /** ExeFS / RomFS extraction, optionally with an update merged in. */
+    EXTRACT,
+
+    /** Export one update as a standalone NSP (baseUri/baseName = the file that holds the update). */
+    UPDATE_NSP,
+}
 
 data class Request(
     val appId: Long,
@@ -30,6 +40,10 @@ data class Request(
     val updateName: String?,
     val exefs: Boolean,
     val romfs: Boolean,
+    val mode: Mode = Mode.EXTRACT,
+    /** UPDATE_NSP only: title id / version of the update to export. */
+    val titleId: Long = 0,
+    val version: Long = -1,
 )
 
 enum class Phase { IDLE, RUNNING, DONE, FAILED, CANCELLED }
@@ -41,6 +55,10 @@ data class ExtractState(
     val done: Long = 0,
     val total: Long = 0,
     val message: String? = null,
+    /** true while / after exporting an update NSP (changes the wording in the dialog). */
+    val nsp: Boolean = false,
+    /** Extra remarks for the user (for example a missing ticket). */
+    val note: String? = null,
 )
 
 object Extractor {
@@ -69,7 +87,7 @@ object Extractor {
 
         pending = r
         cancelFlag = false
-        state.value = ExtractState(Phase.RUNNING, r.title)
+        state.value = ExtractState(Phase.RUNNING, r.title, nsp = r.mode == Mode.UPDATE_NSP)
 
         try {
             ContextCompat.startForegroundService(
@@ -83,6 +101,7 @@ object Extractor {
                 phase = Phase.FAILED,
                 title = r.title,
                 message = e.message ?: e.toString(),
+                nsp = r.mode == Mode.UPDATE_NSP,
             )
         }
     }
@@ -262,6 +281,173 @@ class ExtractService : Service() {
             }
     }
 
+    private fun progressFor(
+        r: Request,
+        nm: NotificationManager,
+    ): Dumper.Progress {
+        var lastUi = 0L
+        var lastNotif = 0L
+
+        return object : Dumper.Progress {
+            override fun update(
+                file: String,
+                done: Long,
+                total: Long,
+            ) {
+                val now = SystemClock.elapsedRealtime()
+
+                if (done < total && now - lastUi < 150) {
+                    return
+                }
+
+                lastUi = now
+
+                Extractor.state.value =
+                    Extractor.state.value.copy(
+                        file = file,
+                        done = done,
+                        total = total,
+                    )
+
+                if (now - lastNotif > 1000) {
+                    lastNotif = now
+
+                    val pct =
+                        if (total > 0) {
+                            (done * 100 / total).toInt()
+                        } else {
+                            0
+                        }
+
+                    nm.notify(
+                        1,
+                        notification(
+                            r.title,
+                            "$pct%  \u00B7  $file",
+                            pct,
+                            false,
+                        ),
+                    )
+                }
+            }
+
+            override fun cancelled(): Boolean {
+                return Extractor.cancelFlag
+            }
+        }
+    }
+
+    /** ExeFS / RomFS extraction. Returns the output folder name. */
+    private fun extractFiles(
+        ctx: Context,
+        r: Request,
+        keys: Keys,
+        tree: Uri,
+        progress: Dumper.Progress,
+        onSink: (SafSink) -> Unit,
+    ): String {
+        val folder =
+            (
+                r.title
+                    .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    .trim()
+                    .ifEmpty { "game" }
+                ) +
+                " [%016X]".format(r.appId) +
+                if (r.updateUri != null) {
+                    " + update"
+                } else {
+                    ""
+                }
+
+        val s = SafSink(
+            ctx,
+            tree,
+            folder,
+            fingerprint(ctx, r),
+        )
+
+        onSink(s)
+
+        openContainer(
+            ctx,
+            Uri.parse(r.baseUri),
+            r.baseName,
+        ).use { base ->
+            val updateUri = r.updateUri
+
+            val update =
+                if (updateUri == null) {
+                    null
+                } else if (updateUri == r.baseUri) {
+                    base
+                } else {
+                    openContainer(
+                        ctx,
+                        Uri.parse(updateUri),
+                        r.updateName ?: "update",
+                    )
+                }
+
+            try {
+                Dumper.dump(
+                    base,
+                    update,
+                    r.appId,
+                    r.exefs,
+                    r.romfs,
+                    keys,
+                    s,
+                    progress,
+                )
+            } finally {
+                if (update != null && update !== base) {
+                    update.close()
+                }
+            }
+        }
+
+        return s.topName
+    }
+
+    /** Exports the update as a standalone NSP in the output folder. Returns the NSP file name. */
+    private fun exportUpdateNsp(
+        ctx: Context,
+        r: Request,
+        keys: Keys,
+        tree: Uri,
+        progress: Dumper.Progress,
+        onSink: (NspSink) -> Unit,
+    ): String {
+        return openContainer(
+            ctx,
+            Uri.parse(r.baseUri),
+            r.baseName,
+        ).use { c ->
+            val plan = UpdateNsp.plan(
+                c,
+                keys,
+                r.titleId,
+                r.version,
+            )
+
+            val s = NspSink(ctx, tree)
+
+            onSink(s)
+
+            UpdateNsp.export(c, plan, s, progress)
+
+            if (plan.warnings.isNotEmpty()) {
+                Extractor.state.value =
+                    Extractor.state.value.copy(
+                        note = plan.warnings.joinToString("\n"),
+                    )
+            }
+
+            s.finalName ?: plan.fileName
+        }
+    }
+
     private fun run(
         r: Request,
         nm: NotificationManager,
@@ -271,6 +457,7 @@ class ExtractService : Service() {
         var phase = Phase.DONE
         var msg: String? = null
         var sink: SafSink? = null
+        var nspSink: NspSink? = null
 
         try {
             val keys = KeyStore.load(ctx)
@@ -281,118 +468,14 @@ class ExtractService : Service() {
                 ?.let { Uri.parse(it) }
                 ?: throw IOException("Output folder is not set")
 
-            val folder =
-                (
-                    r.title
-                        .replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                        .trim()
-                        .ifEmpty { "game" }
-                    ) +
-                    " [%016X]".format(r.appId) +
-                    if (r.updateUri != null) {
-                        " + update"
-                    } else {
-                        ""
-                    }
+            val progress = progressFor(r, nm)
 
-            val s = SafSink(
-                ctx,
-                tree,
-                folder,
-                fingerprint(ctx, r),
-            )
-
-            sink = s
-            msg = s.topName
-
-            var lastUi = 0L
-            var lastNotif = 0L
-
-            val progress = object : Dumper.Progress {
-                override fun update(
-                    file: String,
-                    done: Long,
-                    total: Long,
-                ) {
-                    val now = SystemClock.elapsedRealtime()
-
-                    if (done < total && now - lastUi < 150) {
-                        return
-                    }
-
-                    lastUi = now
-
-                    Extractor.state.value =
-                        Extractor.state.value.copy(
-                            file = file,
-                            done = done,
-                            total = total,
-                        )
-
-                    if (now - lastNotif > 1000) {
-                        lastNotif = now
-
-                        val pct =
-                            if (total > 0) {
-                                (done * 100 / total).toInt()
-                            } else {
-                                0
-                            }
-
-                        nm.notify(
-                            1,
-                            notification(
-                                r.title,
-                                "$pct%  ·  $file",
-                                pct,
-                                false,
-                            ),
-                        )
-                    }
+            msg =
+                if (r.mode == Mode.UPDATE_NSP) {
+                    exportUpdateNsp(ctx, r, keys, tree, progress) { nspSink = it }
+                } else {
+                    extractFiles(ctx, r, keys, tree, progress) { sink = it }
                 }
-
-                override fun cancelled(): Boolean {
-                    return Extractor.cancelFlag
-                }
-            }
-
-            openContainer(
-                ctx,
-                Uri.parse(r.baseUri),
-                r.baseName,
-            ).use { base ->
-                val updateUri = r.updateUri
-
-                val update =
-                    if (updateUri == null) {
-                        null
-                    } else if (updateUri == r.baseUri) {
-                        base
-                    } else {
-                        openContainer(
-                            ctx,
-                            Uri.parse(updateUri),
-                            r.updateName ?: "update",
-                        )
-                    }
-
-                try {
-                    Dumper.dump(
-                        base,
-                        update,
-                        r.appId,
-                        r.exefs,
-                        r.romfs,
-                        keys,
-                        s,
-                        progress,
-                    )
-                } finally {
-                    if (update != null && update !== base) {
-                        update.close()
-                    }
-                }
-            }
         } catch (e: Throwable) {
             if (
                 Extractor.cancelFlag ||
@@ -401,8 +484,12 @@ class ExtractService : Service() {
             ) {
                 phase = Phase.CANCELLED
                 msg =
-                    "Cancelled. Finished files were kept; " +
-                    "start the same extraction again to continue."
+                    if (r.mode == Mode.UPDATE_NSP) {
+                        "Cancelled. The unfinished NSP was removed."
+                    } else {
+                        "Cancelled. Finished files were kept; " +
+                            "start the same extraction again to continue."
+                    }
             } else {
                 phase = Phase.FAILED
                 msg = e.message ?: e.toString()
@@ -410,6 +497,7 @@ class ExtractService : Service() {
         } finally {
             // Remove only the half-written file, if one exists.
             sink?.discardPartial()
+            nspSink?.discardPartial()
             this@ExtractService.releaseWakeLock()
         }
 
@@ -424,9 +512,11 @@ class ExtractService : Service() {
             ServiceCompat.STOP_FOREGROUND_REMOVE,
         )
 
+        val done = if (r.mode == Mode.UPDATE_NSP) "Export complete" else "Extraction complete"
+
         val text =
             when (phase) {
-                Phase.DONE -> "Extraction complete"
+                Phase.DONE -> done
                 Phase.CANCELLED -> "Cancelled"
                 else -> "Failed: $msg"
             }
