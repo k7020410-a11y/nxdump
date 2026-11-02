@@ -224,3 +224,4 @@ class NspSink(
     private companion object {
         const val MIME = "application/octet-stream"
     }
+}
