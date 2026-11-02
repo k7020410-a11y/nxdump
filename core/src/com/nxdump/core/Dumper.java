@@ -339,7 +339,7 @@ public final class Dumper {
         }
 
         long done = 0;
-        byte[] buf = new byte[1 << 20];
+        byte[] buf = new byte[4 << 20]; // 4 MB buffer for high throughput
 
         for (Job j : jobs) {
             if (prog.cancelled()) {
@@ -369,7 +369,6 @@ public final class Dumper {
                             sink.open(j.path)
             ) {
                 long p = 0;
-
                 while (p < j.size) {
                     if (prog.cancelled()) {
                         throw new InterruptedIOException(
