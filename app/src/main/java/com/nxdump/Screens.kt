@@ -403,8 +403,9 @@ fun UpdatesScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) 
         ) {
             item {
                 Text(
-                    "Export an update as a standalone .nsp. The base game is not needed; " +
-                        "the update's files are copied unchanged (still encrypted), together with its ticket.",
+                    "The base game is not needed here. Export as NSP copies the update's files unchanged (still encrypted) " +
+                        "with its ticket. Extract (decrypted) gives the full ExeFS and the RomFS files the update " +
+                        "carries completely; files that need the base game are skipped and listed.",
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -435,14 +436,18 @@ fun UpdatesScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) 
                 OutlinedButton(onClick = pickers.outputFolder, modifier = Modifier.fillMaxWidth()) { Text("Choose output folder first") }
             }
             items(vm.updates, key = { "${it.uri}|${it.titleId}|${it.version}" }) { u ->
-                UpdateCard(u, enabled = vm.outputName != null) { vm.exportUpdateNsp(u) }
+                UpdateCard(
+                    u, enabled = vm.outputName != null,
+                    onExport = { vm.exportUpdateNsp(u) },
+                    onExtract = { vm.extractUpdateFiles(u) },
+                )
             }
         }
     }
 }
 
 @Composable
-fun UpdateCard(u: Entry, enabled: Boolean, onExport: () -> Unit) {
+fun UpdateCard(u: Entry, enabled: Boolean, onExport: () -> Unit, onExtract: () -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -467,6 +472,9 @@ fun UpdateCard(u: Entry, enabled: Boolean, onExport: () -> Unit) {
                 Icon(Icons.Default.Download, null, Modifier.size(20.dp))
                 Spacer(Modifier.size(8.dp))
                 Text("Export as NSP")
+            }
+            OutlinedButton(onClick = onExtract, enabled = enabled, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                Text("Extract (decrypted)")
             }
         }
     }
