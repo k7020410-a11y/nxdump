@@ -121,3 +121,91 @@ object Extractor {
         }
     }
 }
+class ExtractService : Service() {
+    private val channelId = "extract"
+
+    @Volatile
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int,
+    ): Int {
+        val req = Extractor.pending
+
+        val nm = getSystemService(NotificationManager::class.java)
+
+        nm.createNotificationChannel(
+            NotificationChannel(
+                channelId,
+                "Extraction",
+                NotificationManager.IMPORTANCE_LOW,
+            ),
+        )
+
+        // Android requires startForeground() after every startForegroundService().
+        ServiceCompat.startForeground(
+            this,
+            1,
+            notification(
+                req?.title ?: "NxDump",
+                "Preparing…",
+                0,
+                true,
+            ),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
+
+        if (req == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // Never run two extractions at the same time.
+        if (Extractor.worker?.isAlive == true) {
+            return START_NOT_STICKY
+        }
+
+        acquireWakeLock()
+
+        Extractor.worker = Thread(
+            { run(req, nm) },
+            "nxdump-extract",
+        ).also {
+            it.start()
+        }
+
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        this.releaseWakeLock()
+        super.onDestroy()
+    }
+
+    /**
+     * Keeps the CPU running with the screen off.
+     *
+     * Requires:
+     * <uses-permission android:name="android.permission.WAKE_LOCK" />
+     */
+    private fun acquireWakeLock() {
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "nxdump:extract",
+            ).apply {
+                setReferenceCounted(false)
+                acquire(6 * 60 * 60 * 1000L)
+            }
+        } catch (e: Throwable) {
+            // Permission missing or not allowed: continue without WakeLock.
+        }
+    }
+
+    private fun releaseWakeLock() {
