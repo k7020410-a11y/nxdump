@@ -19,50 +19,119 @@ public interface Source {
         return b;
     }
 
-    default Source slice(long off, long len) { return new Slice(this, off, len); }
+    default Source slice(long off, long len) {
+        return new Slice(this, off, len);
+    }
 
     final class Slice implements Source {
         private final Source parent;
         private final long off, len;
-        public Slice(Source parent, long off, long len) { this.parent = parent; this.off = off; this.len = len; }
-        @Override public long size() { return len; }
-        @Override public void read(long pos, byte[] b, int o, int n) throws IOException {
-            if (pos < 0 || n < 0 || pos + n > len) throw new EOFException("Read past end of region");
+
+        public Slice(Source parent, long off, long len) {
+            this.parent = parent;
+            this.off = off;
+            this.len = len;
+        }
+
+        @Override
+        public long size() {
+            return len;
+        }
+
+        @Override
+        public void read(long pos, byte[] b, int o, int n)
+                throws IOException {
+            if (pos < 0 || n < 0 || pos > len - n) {
+                throw new EOFException("Read past end of region");
+            }
+
             parent.read(off + pos, b, o, n);
         }
     }
 
     final class Bytes implements Source {
         private final byte[] data;
-        public Bytes(byte[] data) { this.data = data; }
-        @Override public long size() { return data.length; }
-        @Override public void read(long pos, byte[] b, int o, int n) throws IOException {
-            if (pos < 0 || n < 0 || pos + n > data.length) throw new EOFException("Read past end of buffer");
+
+        public Bytes(byte[] data) {
+            this.data = data;
+        }
+
+        @Override
+        public long size() {
+            return data.length;
+        }
+
+        @Override
+        public void read(long pos, byte[] b, int o, int n)
+                throws IOException {
+            if (pos < 0 || n < 0 || pos > data.length - n) {
+                throw new EOFException("Read past end of buffer");
+            }
+
             System.arraycopy(data, (int) pos, b, o, n);
         }
     }
 
     final class OfChannel implements Source, Closeable {
+        private static final int MAX_EMPTY_READS = 8;
+
         private final FileChannel ch;
         private final long size;
         private final Closeable extra;
-        public OfChannel(FileChannel ch, Closeable extra) throws IOException {
-            this.ch = ch; this.size = ch.size(); this.extra = extra;
+
+        public OfChannel(FileChannel ch, Closeable extra)
+                throws IOException {
+            this.ch = ch;
+            this.size = ch.size();
+            this.extra = extra;
         }
-        @Override public long size() { return size; }
-        @Override public void read(long pos, byte[] b, int o, int n) throws IOException {
-            if (pos < 0 || n < 0 || pos + n > size) throw new EOFException("Read past end of file");
+
+        @Override
+        public long size() {
+            return size;
+        }
+
+        @Override
+        public void read(long pos, byte[] b, int o, int n)
+                throws IOException {
+            if (pos < 0 || n < 0 || pos > size - n) {
+                throw new EOFException("Read past end of file");
+            }
+
             ByteBuffer bb = ByteBuffer.wrap(b, o, n);
             long p = pos;
+            int empty = 0;
+
             while (bb.hasRemaining()) {
                 int r = ch.read(bb, p);
-                if (r < 0) throw new EOFException("Unexpected end of file");
+
+                if (r < 0) {
+                    throw new EOFException("Unexpected end of file");
+                }
+
+                if (r == 0) {
+                    if (++empty > MAX_EMPTY_READS) {
+                        throw new IOException(
+                                "File read made no progress"
+                        );
+                    }
+
+                    Thread.yield();
+                    continue;
+                }
+
+                empty = 0;
                 p += r;
             }
         }
-        @Override public void close() throws IOException {
+
+        @Override
+        public void close() throws IOException {
             ch.close();
-            if (extra != null) extra.close();
+
+            if (extra != null) {
+                extra.close();
+            }
         }
     }
 }
