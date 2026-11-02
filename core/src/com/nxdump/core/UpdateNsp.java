@@ -1,9 +1,6 @@
 package com.nxdump.core;
 
 import java.io.ByteArrayOutputStream;
-package com.nxdump.core;
-
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
@@ -331,4 +328,4 @@ public final class UpdateNsp {
             b[o + i] = (byte) (v >>> (8 * i));
         }
     }
-          }
+}
