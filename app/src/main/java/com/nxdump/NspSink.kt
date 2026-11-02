@@ -173,7 +173,7 @@ class NspSink(
         val output = resolver.openOutputStream(uri, "w")
             ?: throw IOException("Cannot write $name")
 
-        return BufferedOutputStream(output, 1 shl 20)
+        return BufferedOutputStream(output, 4 shl 20)
     }
 
     override fun commit(
