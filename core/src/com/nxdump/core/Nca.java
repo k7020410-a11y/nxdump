@@ -60,62 +60,60 @@ public final class Nca {
         System.arraycopy(h, 0x230, rightsId, 0, 16);
         System.arraycopy(h, 0x300, keyArea, 0, 0x40);
         for (int i = 0; i < 4; i++) {
-            long s = (Bin.le32(h, 0x240 + i * 16) & 0xFFFFFFFFL) * 0x200;
-            long e = (Bin.le32(h, 0x244 + i * 16) & 0xFFFFFFFFL) * 0x200;
-            sections[i] = new Section(i, s, e, Arrays.copyOfRange(h, 0x400 + i * 0x200, 0x600 + i * 0x200));
+            long start = (long) Bin.le32(h, 0x240 + i * 8) << 9;
+            long end = (long) Bin.le32(h, 0x244 + i * 8) << 9;
+            byte[] sh = Arrays.copyOfRange(h, 0x400 + i * 0x200, 0x600 + i * 0x200);
+            sections[i] = new Section(i, start, end, sh);
         }
     }
 
-    public boolean hasRightsId() { for (byte b : rightsId) if (b != 0) return true; return false; }
-    public String rightsIdHex() { return Bin.hex(rightsId); }
-
-    /** True if this is an update NCA (RomFS stored as a BKTR patch). */
-    public boolean isPatchRomFs() {
-        Section s = section(FS_ROMFS);
-        return s != null && s.encType == ENC_CTR_EX;
+    public boolean hasRightsId() {
+        for (byte b : rightsId) if (b != 0) return true;
+        return false;
     }
 
-    /** First existing section with the given fs type, or null. */
+    public byte[] contentKey() throws IOException {
+        if (contentKey != null) return contentKey;
+        if (hasRightsId()) {
+            byte[] tk = keys.titleKey(rightsId);
+            if (tk == null) throw new NxException(name + ": missing title key for rights_id " + Bin.hex(rightsId));
+            contentKey = Aes.decryptTitleKey(tk, keys.titlekek(keyGen));
+        } else {
+            contentKey = Aes.decryptKeyArea(keyArea, keys.keyAreaKey(kakIndex, keyGen));
+        }
+        return contentKey;
+    }
+
     public Section section(int fsType) {
         for (Section s : sections) if (s.exists() && s.fsType == fsType) return s;
         return null;
     }
 
-    private byte[] contentKey() throws IOException {
-        if (contentKey != null) return contentKey;
-        if (hasRightsId()) {
-            byte[] enc = keys.titleKey(rightsIdHex());
-            if (enc == null)
-                throw new NxException(name + ": no title key for rights id " + rightsIdHex()
-                        + " (add title.keys or place the .tik in the same NSP)");
-            contentKey = Aes.ecbDecrypt(keys.titlekek(keyGen), enc);
-        } else {
-            byte[] area = Aes.ecbDecrypt(keys.kak(kakIndex, keyGen), keyArea);
-            contentKey = Arrays.copyOfRange(area, 0x20, 0x30);
-        }
-        return contentKey;
+    public boolean isPatchRomFs() {
+        Section s = section(FS_ROMFS);
+        return s != null && s.encType == ENC_CTR_EX;
     }
 
-    private static byte[] upper16(Section s) {
-        byte[] u = new byte[16];
-        for (int i = 0; i < 8; i++) u[i] = s.hdr[0x140 + 7 - i];
-        return u;
-    }
-
-    /** Decrypted section contents (offset 0 = start of section). */
     public Source openSection(Section s) throws IOException {
-        if (s == null || !s.exists()) throw new NxException(name + ": section missing");
         Source raw = src.slice(s.start, s.size());
-        switch (s.encType) {
-            case ENC_NONE: return raw;
-            case 0:
-            case ENC_CTR: return new Ctr(raw, contentKey(), upper16(s), s.start);
-            case ENC_CTR_EX: throw new NxException(name + ": patch section needs a base game");
-            default: throw new NxException(name + ": unsupported section encryption " + s.encType);
+        if (s.encType == ENC_NONE) return raw;
+        byte[] key = contentKey();
+        byte[] up = upper16(s);
+        if (s.encType == ENC_CTR) return new Ctr(raw, key, up, s.start);
+        if (s.encType == ENC_CTR_EX) {
+            // subsection table is inside the section header area of the encrypted section
+            throw new NxException(name + ": use openPatchedRomFs / openPatchOnlyRomFs for CTR-Ex sections");
         }
+        throw new NxException(name + ": unsupported encryption " + s.encType);
     }
 
-    /** The filesystem payload of a section: PFS0 image, or RomFS image inside the IVFC layout. */
+    private byte[] upper16(Section s) {
+        byte[] up = new byte[16];
+        long ctr = s.start >> 4;
+        for (int i = 15; i >= 8; i--) { up[i] = (byte) ctr; ctr >>>= 8; }
+        return up;
+    }
+
     public Source openData(Section s) throws IOException { return fsData(s, openSection(s)); }
 
     Source fsData(Section s, Source decrypted) throws IOException {
@@ -129,6 +127,45 @@ public final class Nca {
 
     /** RomFS image of an update NCA merged on top of the base game's decrypted RomFS section. */
     public Source openPatchedRomFs(Section patchSec, Source baseSection) throws IOException {
+        return fsData(patchSec, patchedStorage(patchSec, baseSection));
+    }
+
+    /** RomFS of an update without its base game: only the data the update itself carries can be read. */
+    public static final class PatchOnly {
+        /** RomFS image. Reading a range that lives in the base game throws. */
+        public final Source image;
+        private final Patched patched;
+        private final long dataOff;
+
+        PatchOnly(Source image, Patched patched, long dataOff) {
+            this.image = image; this.patched = patched; this.dataOff = dataOff;
+        }
+
+        /** True if every byte of [off, off+len) of the RomFS image is stored inside the update. */
+        public boolean covers(long off, long len) { return patched.covers(dataOff + off, len); }
+    }
+
+    public PatchOnly openPatchOnlyRomFs(Section patchSec) throws IOException {
+        Source noBase = new Source() {
+            @Override public long size() { return Long.MAX_VALUE / 2; }
+            @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
+                throw new NxException(name + ": this data is stored in the base game, which is not available");
+            }
+        };
+        Patched p = patchedStorage(patchSec, noBase);
+        long off = dataRange(patchSec)[0];
+        return new PatchOnly(fsData(patchSec, p), p, off);
+    }
+
+    private long[] dataRange(Section s) throws IOException {
+        long off, len;
+        if (s.hashType == 2 || s.hashType == 5) { off = Bin.le64(s.hdr, 0x40); len = Bin.le64(s.hdr, 0x48); }
+        else if (s.hashType == 3 || s.hashType == 6) { off = Bin.le64(s.hdr, 0x90); len = Bin.le64(s.hdr, 0x98); }
+        else throw new NxException(name + ": unsupported hash layout " + s.hashType);
+        return new long[]{off, len};
+    }
+
+    private Patched patchedStorage(Section patchSec, Source baseSection) throws IOException {
         byte[] h = patchSec.hdr;
         long relOff = Bin.le64(h, 0x100), relSize = Bin.le64(h, 0x108);
         long subOff, subSize;
@@ -165,7 +202,7 @@ public final class Nca {
             phys[i] = Bin.le64(rel.get(i), 8);
             stor[i] = Bin.le32(rel.get(i), 16);
         }
-        return fsData(patchSec, new Patched(virt, phys, stor, baseSection, patchData));
+        return new Patched(virt, phys, stor, baseSection, patchData);
     }
 
     private static List<byte[]> readTree(Source s, long off, long size, int entrySize, int count) throws IOException {
@@ -241,6 +278,19 @@ public final class Nca {
             this.virt = virt; this.phys = phys; this.stor = stor; this.base = base; this.patch = patch;
         }
         @Override public long size() { return Long.MAX_VALUE / 2; }
+
+        /** True if [pos, pos+len) is entirely mapped to the patch (not to the base game). */
+        boolean covers(long pos, long len) {
+            while (len > 0) {
+                int i = floorIdx(virt, pos);
+                long end = i + 1 < virt.length ? virt[i + 1] : Long.MAX_VALUE;
+                long n = Math.min(len, end - pos);
+                if (stor[i] == 0) return false;
+                pos += n; len -= n;
+            }
+            return true;
+        }
+
         @Override public void read(long pos, byte[] b, int off, int len) throws IOException {
             while (len > 0) {
                 int i = floorIdx(virt, pos);
