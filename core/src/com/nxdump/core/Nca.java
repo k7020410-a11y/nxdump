@@ -60,60 +60,62 @@ public final class Nca {
         System.arraycopy(h, 0x230, rightsId, 0, 16);
         System.arraycopy(h, 0x300, keyArea, 0, 0x40);
         for (int i = 0; i < 4; i++) {
-            long start = (long) Bin.le32(h, 0x240 + i * 8) << 9;
-            long end = (long) Bin.le32(h, 0x244 + i * 8) << 9;
-            byte[] sh = Arrays.copyOfRange(h, 0x400 + i * 0x200, 0x600 + i * 0x200);
-            sections[i] = new Section(i, start, end, sh);
+            long s = (Bin.le32(h, 0x240 + i * 16) & 0xFFFFFFFFL) * 0x200;
+            long e = (Bin.le32(h, 0x244 + i * 16) & 0xFFFFFFFFL) * 0x200;
+            sections[i] = new Section(i, s, e, Arrays.copyOfRange(h, 0x400 + i * 0x200, 0x600 + i * 0x200));
         }
     }
 
-    public boolean hasRightsId() {
-        for (byte b : rightsId) if (b != 0) return true;
-        return false;
-    }
+    public boolean hasRightsId() { for (byte b : rightsId) if (b != 0) return true; return false; }
+    public String rightsIdHex() { return Bin.hex(rightsId); }
 
-    public byte[] contentKey() throws IOException {
-        if (contentKey != null) return contentKey;
-        if (hasRightsId()) {
-            byte[] tk = keys.titleKey(rightsId);
-            if (tk == null) throw new NxException(name + ": missing title key for rights_id " + Bin.hex(rightsId));
-            contentKey = Aes.decryptTitleKey(tk, keys.titlekek(keyGen));
-        } else {
-            contentKey = Aes.decryptKeyArea(keyArea, keys.keyAreaKey(kakIndex, keyGen));
-        }
-        return contentKey;
-    }
-
-    public Section section(int fsType) {
-        for (Section s : sections) if (s.exists() && s.fsType == fsType) return s;
-        return null;
-    }
-
+    /** True if this is an update NCA (RomFS stored as a BKTR patch). */
     public boolean isPatchRomFs() {
         Section s = section(FS_ROMFS);
         return s != null && s.encType == ENC_CTR_EX;
     }
 
-    public Source openSection(Section s) throws IOException {
-        Source raw = src.slice(s.start, s.size());
-        if (s.encType == ENC_NONE) return raw;
-        byte[] key = contentKey();
-        byte[] up = upper16(s);
-        if (s.encType == ENC_CTR) return new Ctr(raw, key, up, s.start);
-        if (s.encType == ENC_CTR_EX) {
-            // subsection table is inside the section header area of the encrypted section
-            throw new NxException(name + ": use openPatchedRomFs / openPatchOnlyRomFs for CTR-Ex sections");
+    /** First existing section with the given fs type, or null. */
+    public Section section(int fsType) {
+        for (Section s : sections) if (s.exists() && s.fsType == fsType) return s;
+        return null;
+    }
+
+    private byte[] contentKey() throws IOException {
+        if (contentKey != null) return contentKey;
+        if (hasRightsId()) {
+            byte[] enc = keys.titleKey(rightsIdHex());
+            if (enc == null)
+                throw new NxException(name + ": no title key for rights id " + rightsIdHex()
+                        + " (add title.keys or place the .tik in the same NSP)");
+            contentKey = Aes.ecbDecrypt(keys.titlekek(keyGen), enc);
+        } else {
+            byte[] area = Aes.ecbDecrypt(keys.kak(kakIndex, keyGen), keyArea);
+            contentKey = Arrays.copyOfRange(area, 0x20, 0x30);
         }
-        throw new NxException(name + ": unsupported encryption " + s.encType);
+        return contentKey;
     }
 
-    private byte[] upper16(Section s) {
-        byte[] up = new byte[16];
-        long ctr = s.start >> 4;
-        for (int i = 15; i >= 8; i--) { up[i] = (byte) ctr; ctr >>>= 8; }
-        return up;
+    private static byte[] upper16(Section s) {
+        byte[] u = new byte[16];
+        for (int i = 0; i < 8; i++) u[i] = s.hdr[0x140 + 7 - i];
+        return u;
     }
 
+    /** Decrypted section contents (offset 0 = start of section). */
+    public Source openSection(Section s) throws IOException {
+        if (s == null || !s.exists()) throw new NxException(name + ": section missing");
+        Source raw = src.slice(s.start, s.size());
+        switch (s.encType) {
+            case ENC_NONE: return raw;
+            case 0:
+            case ENC_CTR: return new Ctr(raw, contentKey(), upper16(s), s.start);
+            case ENC_CTR_EX: throw new NxException(name + ": patch section needs a base game");
+            default: throw new NxException(name + ": unsupported section encryption " + s.encType);
+        }
+    }
+
+    /** The filesystem payload of a section: PFS0 image, or RomFS image inside the IVFC layout. */
     public Source openData(Section s) throws IOException { return fsData(s, openSection(s)); }
 
     Source fsData(Section s, Source decrypted) throws IOException {
