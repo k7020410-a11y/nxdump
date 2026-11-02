@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AlertDialog
@@ -59,6 +60,8 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -146,6 +149,10 @@ fun NxApp(vm: AppViewModel) {
             Wizard(vm, pickers, snack)
         } else when (vm.screen) {
             Screen.LIBRARY -> LibraryScreen(vm, pickers, snack)
+            Screen.UPDATES -> {
+                BackHandler { vm.screen = Screen.LIBRARY }
+                UpdatesScreen(vm, pickers, snack)
+            }
             Screen.SETTINGS -> {
                 BackHandler { vm.screen = Screen.LIBRARY }
                 SettingsScreen(vm, pickers, snack)
@@ -289,6 +296,7 @@ fun LibraryScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) 
         modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
         containerColor = Color.Transparent,
         snackbarHost = { SnackbarHost(snack) },
+        bottomBar = { MainNavBar(vm) },
         topBar = {
             LargeTopAppBar(
                 title = { Text("Library") }, scrollBehavior = scroll,
@@ -339,6 +347,129 @@ fun LibraryScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) 
         }
     }
     vm.games.find { it.appId == selectedId }?.let { g -> GameSheet(vm, g, pickers) { selectedId = null } }
+}
+
+@Composable
+fun MainNavBar(vm: AppViewModel) {
+    NavigationBar {
+        NavigationBarItem(
+            selected = vm.screen == Screen.LIBRARY,
+            onClick = { vm.screen = Screen.LIBRARY },
+            icon = { Icon(Icons.Default.SportsEsports, null) },
+            label = { Text("Games") },
+        )
+        NavigationBarItem(
+            selected = vm.screen == Screen.UPDATES,
+            onClick = { vm.screen = Screen.UPDATES },
+            icon = { Icon(Icons.Default.SystemUpdate, null) },
+            label = { Text("Updates") },
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Updates (separate screen: export an update as its own NSP, no base game needed)
+// ---------------------------------------------------------------------------------------------
+
+@Composable
+fun UpdatesScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState) {
+    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    Scaffold(
+        modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
+        containerColor = Color.Transparent,
+        snackbarHost = { SnackbarHost(snack) },
+        bottomBar = { MainNavBar(vm) },
+        topBar = {
+            LargeTopAppBar(
+                title = { Text("Updates") }, scrollBehavior = scroll,
+                actions = {
+                    IconButton(onClick = { vm.rescan(true) }) { Icon(Icons.Default.Refresh, "Rescan") }
+                    IconButton(onClick = { vm.screen = Screen.SETTINGS }) { Icon(Icons.Default.Settings, "Settings") }
+                },
+            )
+        },
+        floatingActionButton = {
+            ExtendedFloatingActionButton(
+                onClick = pickers.addFile, icon = { Icon(Icons.Default.Add, null) }, text = { Text("Add update") },
+            )
+        },
+    ) { pad ->
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = 16.dp, end = 16.dp, top = pad.calculateTopPadding() + 8.dp, bottom = pad.calculateBottomPadding() + 96.dp,
+            ),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                Text(
+                    "Export an update as a standalone .nsp. The base game is not needed; " +
+                        "the update's files are copied unchanged (still encrypted), together with its ticket.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (vm.scanning) item {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        if (vm.scanTotal > 0) "Scanning ${vm.scanDone} / ${vm.scanTotal}\u2026" else "Looking for updates\u2026",
+                        style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (vm.scanTotal > 0) LinearProgressIndicator(progress = { vm.scanDone / vm.scanTotal.toFloat() }, Modifier.fillMaxWidth())
+                    else LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+            }
+            if (vm.updates.isEmpty() && !vm.scanning) item {
+                Column(
+                    Modifier.fillMaxWidth().padding(top = 48.dp), horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(Icons.Default.SystemUpdate, null, Modifier.size(56.dp), tint = MaterialTheme.colorScheme.outline)
+                    Text("No updates yet", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Updates in your game folder show up here. You can also tap Add update.",
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (vm.outputName == null && vm.updates.isNotEmpty()) item {
+                OutlinedButton(onClick = pickers.outputFolder, modifier = Modifier.fillMaxWidth()) { Text("Choose output folder first") }
+            }
+            items(vm.updates, key = { "${it.uri}|${it.titleId}|${it.version}" }) { u ->
+                UpdateCard(u, enabled = vm.outputName != null) { vm.exportUpdateNsp(u) }
+            }
+        }
+    }
+}
+
+@Composable
+fun UpdateCard(u: Entry, enabled: Boolean, onExport: () -> Unit) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                GameIcon(u, 56.dp)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(u.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        "%016X".format(u.titleId), style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Pill("Update ${versionLabel(u)}", MaterialTheme.colorScheme.tertiaryContainer, MaterialTheme.colorScheme.onTertiaryContainer)
+                        Pill(fmtSize(u.size), MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            Text(
+                u.fileName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(onClick = onExport, enabled = enabled, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                Icon(Icons.Default.Download, null, Modifier.size(20.dp))
+                Spacer(Modifier.size(8.dp))
+                Text("Export as NSP")
+            }
+        }
+    }
 }
 
 @Composable
@@ -479,7 +610,7 @@ fun ExtractDialog() {
         title = {
             Text(
                 when (st.phase) {
-                    Phase.RUNNING -> "Extracting"
+                    Phase.RUNNING -> if (st.nsp) "Exporting update" else "Extracting"
                     Phase.DONE -> "Done"
                     Phase.CANCELLED -> "Cancelled"
                     else -> "Failed"
@@ -500,7 +631,15 @@ fun ExtractDialog() {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Phase.DONE -> Text("Saved to \u201C${st.message}\u201D in your output folder.")
+                    Phase.DONE -> {
+                        Text(
+                            if (st.nsp) "Saved \u201C${st.message}\u201D in your output folder."
+                            else "Saved to \u201C${st.message}\u201D in your output folder.",
+                        )
+                        st.note?.let {
+                            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
                     else -> Text(
                         st.message ?: "", color = if (st.phase == Phase.FAILED) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
                     )
@@ -563,7 +702,8 @@ fun SettingsScreen(vm: AppViewModel, pickers: Pickers, snack: SnackbarHostState)
             }
             SectionLabel("About")
             Text(
-                "NxDump extracts ExeFS and RomFS from XCI / NSP / NCA files you own. Keys never leave your device. " +
+                "NxDump extracts ExeFS and RomFS from XCI / NSP / NCA files you own, and can export updates as standalone NSP files. " +
+                    "Keys never leave your device. " +
                     "Compressed NSZ/XCZ files are not supported.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
