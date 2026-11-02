@@ -50,6 +50,12 @@ object Extractor {
     /** true from start() until the worker thread is completely finished. */
     val running = AtomicBoolean(false)
 
+    fun reset() {
+        pending = null
+        worker = null
+        running.set(false)
+    }
+
     fun start(ctx: Context, r: Request) {
         if (!running.compareAndSet(false, true)) return
 
@@ -117,7 +123,7 @@ class ExtractService : Service() {
             1,
             notification(
                 req?.title ?: "NxDump",
-                "Preparing\u2026",
+                "Preparing…",
                 0,
                 true,
             ),
@@ -147,7 +153,7 @@ class ExtractService : Service() {
     }
 
     override fun onDestroy() {
-        releaseWakeLock()
+        this.releaseWakeLock()
         super.onDestroy()
     }
 
@@ -329,7 +335,7 @@ class ExtractService : Service() {
                             1,
                             notification(
                                 r.title,
-                                "$pct%  \u00B7  $file",
+                                "$pct%  ·  $file",
                                 pct,
                                 false,
                             ),
@@ -396,7 +402,7 @@ class ExtractService : Service() {
         } finally {
             // Remove only the half-written file, if one exists.
             sink?.discardPartial()
-            releaseWakeLock()
+            this@ExtractService.releaseWakeLock()
         }
 
         Extractor.state.value =
