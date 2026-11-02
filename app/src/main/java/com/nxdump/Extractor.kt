@@ -121,6 +121,7 @@ object Extractor {
         }
     }
 }
+
 class ExtractService : Service() {
     private val channelId = "extract"
 
@@ -209,3 +210,370 @@ class ExtractService : Service() {
     }
 
     private fun releaseWakeLock() {
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                }
+            }
+        } catch (e: Throwable) {
+            // Ignore WakeLock release errors.
+        }
+
+        wakeLock = null
+    }
+
+    private fun notification(
+        title: String,
+        text: String,
+        pct: Int,
+        indeterminate: Boolean,
+        ongoing: Boolean = true,
+    ): Notification =
+        Notification.Builder(this, channelId)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setOnlyAlertOnce(true)
+            .setOngoing(ongoing)
+            .apply {
+                if (ongoing) {
+                    setProgress(100, pct, indeterminate)
+                }
+            }
+            .build()
+
+    /**
+     * Same request + same input files = same fingerprint.
+     * Used to decide whether an existing output folder can be resumed.
+     */
+    private fun fingerprint(
+        ctx: Context,
+        r: Request,
+    ): String {
+        fun sizeOf(uriString: String?): Long =
+            try {
+                if (uriString == null) {
+                    -1L
+                } else {
+                    ctx.contentResolver
+                        .openFileDescriptor(Uri.parse(uriString), "r")
+                        ?.use { it.statSize }
+                        ?: -1L
+                }
+            } catch (e: Exception) {
+                -1L
+            }
+
+        val raw = listOf(
+            "v1",
+            r.appId,
+            r.baseUri,
+            sizeOf(r.baseUri),
+            r.updateUri ?: "-",
+            sizeOf(r.updateUri),
+            r.exefs,
+            r.romfs,
+        ).joinToString("|") +
+            if (r.mode == Mode.EXTRACT) {
+                ""
+            } else {
+                "|${r.mode}|${r.titleId}|${r.version}"
+            }
+
+        return MessageDigest
+            .getInstance("SHA-256")
+            .digest(raw.toByteArray(Charsets.UTF_8))
+            .joinToString("") {
+                "%02x".format(it)
+            }
+    }
+
+    private fun progressFor(
+        r: Request,
+        nm: NotificationManager,
+    ): Dumper.Progress {
+        var lastUi = 0L
+        var lastNotif = 0L
+
+        return object : Dumper.Progress {
+            override fun update(
+                file: String,
+                done: Long,
+                total: Long,
+            ) {
+                val now = SystemClock.elapsedRealtime()
+
+                if (done < total && now - lastUi < 150) {
+                    return
+                }
+
+                lastUi = now
+
+                Extractor.state.value =
+                    Extractor.state.value.copy(
+                        file = file,
+                        done = done,
+                        total = total,
+                    )
+
+                if (now - lastNotif > 1000) {
+                    lastNotif = now
+
+                    val pct =
+                        if (total > 0) {
+                            (done * 100 / total).toInt()
+                        } else {
+                            0
+                        }
+
+                    nm.notify(
+                        1,
+                        notification(
+                            r.title,
+                            "$pct%  \u00B7  $file",
+                            pct,
+                            false,
+                        ),
+                    )
+                }
+            }
+
+            override fun cancelled(): Boolean {
+                return Extractor.cancelFlag
+            }
+        }
+    }
+
+    /** ExeFS / RomFS extraction. Returns the output folder name. */
+    private fun extractFiles(
+        ctx: Context,
+        r: Request,
+        keys: Keys,
+        tree: Uri,
+        progress: Dumper.Progress,
+        onSink: (SafSink) -> Unit,
+    ): String {
+        val folder =
+            (
+                r.title
+                    .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                    .trim()
+                    .ifEmpty { "game" }
+                ) +
+                (
+                    if (r.mode == Mode.UPDATE_FILES) {
+                        " [%016X] update v%d".format(r.titleId, r.version)
+                    } else {
+                        " [%016X]".format(r.appId)
+                    }
+                    ) +
+                if (r.updateUri != null) {
+                    " + update"
+                } else {
+                    ""
+                }
+
+        val s = SafSink(
+            ctx,
+            tree,
+            folder,
+            fingerprint(ctx, r),
+        )
+
+        onSink(s)
+
+        if (r.mode == Mode.UPDATE_FILES) {
+            openContainer(
+                ctx,
+                Uri.parse(r.baseUri),
+                r.baseName,
+            ).use { c ->
+                val res = Dumper.dumpUpdateOnly(
+                    c,
+                    r.titleId,
+                    r.version,
+                    r.exefs,
+                    r.romfs,
+                    keys,
+                    s,
+                    progress,
+                )
+
+                Extractor.state.value =
+                    Extractor.state.value.copy(note = res.note)
+            }
+
+            return s.topName
+        }
+
+        openContainer(
+            ctx,
+            Uri.parse(r.baseUri),
+            r.baseName,
+        ).use { base ->
+            val updateUri = r.updateUri
+
+            val update =
+                if (updateUri == null) {
+                    null
+                } else if (updateUri == r.baseUri) {
+                    base
+                } else {
+                    openContainer(
+                        ctx,
+                        Uri.parse(updateUri),
+                        r.updateName ?: "update",
+                    )
+                }
+
+            try {
+                Dumper.dump(
+                    base,
+                    update,
+                    r.appId,
+                    r.exefs,
+                    r.romfs,
+                    keys,
+                    s,
+                    progress,
+                )
+            } finally {
+                if (update != null && update !== base) {
+                    update.close()
+                }
+            }
+        }
+
+        return s.topName
+    }
+
+    /** Exports the update as a standalone NSP in the output folder. Returns the NSP file name. */
+    private fun exportUpdateNsp(
+        ctx: Context,
+        r: Request,
+        keys: Keys,
+        tree: Uri,
+        progress: Dumper.Progress,
+        onSink: (NspSink) -> Unit,
+    ): String {
+        return openContainer(
+            ctx,
+            Uri.parse(r.baseUri),
+            r.baseName,
+        ).use { c ->
+            val plan = UpdateNsp.plan(
+                c,
+                keys,
+                r.titleId,
+                r.version,
+            )
+
+            val s = NspSink(ctx, tree)
+
+            onSink(s)
+
+            UpdateNsp.export(c, plan, s, progress)
+
+            if (plan.warnings.isNotEmpty()) {
+                Extractor.state.value =
+                    Extractor.state.value.copy(
+                        note = plan.warnings.joinToString("\n"),
+                    )
+            }
+
+            s.finalName ?: plan.fileName
+        }
+    }
+
+    private fun run(
+        r: Request,
+        nm: NotificationManager,
+    ) {
+        val ctx = applicationContext
+
+        var phase = Phase.DONE
+        var msg: String? = null
+        var sink: SafSink? = null
+        var nspSink: NspSink? = null
+
+        try {
+            val keys = KeyStore.load(ctx)
+                ?: throw IOException("Keys are not set up")
+
+            val tree = Prefs(ctx)
+                .outputTree
+                ?.let { Uri.parse(it) }
+                ?: throw IOException("Output folder is not set")
+
+            val progress = progressFor(r, nm)
+
+            msg =
+                if (r.mode == Mode.UPDATE_NSP) {
+                    exportUpdateNsp(ctx, r, keys, tree, progress) { nspSink = it }
+                } else {
+                    extractFiles(ctx, r, keys, tree, progress) { sink = it }
+                }
+        } catch (e: Throwable) {
+            if (
+                Extractor.cancelFlag ||
+                e is InterruptedIOException ||
+                e is ClosedByInterruptException
+            ) {
+                phase = Phase.CANCELLED
+                msg =
+                    if (r.mode == Mode.UPDATE_NSP) {
+                        "Cancelled. The unfinished NSP was removed."
+                    } else {
+                        "Cancelled. Finished files were kept; " +
+                            "start the same extraction again to continue."
+                    }
+            } else {
+                phase = Phase.FAILED
+                msg = e.message ?: e.toString()
+            }
+        } finally {
+            // Remove only the half-written file, if one exists.
+            sink?.discardPartial()
+            nspSink?.discardPartial()
+            this@ExtractService.releaseWakeLock()
+        }
+
+        Extractor.state.value =
+            Extractor.state.value.copy(
+                phase = phase,
+                message = msg,
+            )
+
+        ServiceCompat.stopForeground(
+            this,
+            ServiceCompat.STOP_FOREGROUND_REMOVE,
+        )
+
+        val done = if (r.mode == Mode.UPDATE_NSP) "Export complete" else "Extraction complete"
+
+        val text =
+            when (phase) {
+                Phase.DONE -> done
+                Phase.CANCELLED -> "Cancelled"
+                else -> "Failed: $msg"
+            }
+
+        nm.notify(
+            2,
+            notification(
+                r.title,
+                text,
+                0,
+                false,
+                ongoing = false,
+            ),
+        )
+
+        Extractor.pending = null
+        Extractor.worker = null
+        Extractor.running.set(false)
+
+        stopSelf()
+    }
+}
